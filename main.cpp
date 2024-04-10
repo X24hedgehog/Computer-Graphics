@@ -73,6 +73,10 @@ Vector gamma_correction(const Vector &a)
 {
     return Vector(std::min<double>(255, pow(a[0], 1 / 2.2)), std::min<double>(255, pow(a[1], 1 / 2.2)), std::min<double>(255, pow(a[2], 1 / 2.2)));
 }
+Vector operator*(const Vector &a, const Vector &b)
+{
+    return Vector(a[0] * b[0], a[1] * b[1], a[2] * b[2]);
+}
 
 class Ray
 {
@@ -125,6 +129,39 @@ public:
     }
 };
 
+Vector randomCos(const Vector &N)
+{
+    double r1 = ((double)rand() / (RAND_MAX));
+    double r2 = ((double)rand() / (RAND_MAX));
+    double x = cos(2 * M_PI * r1) * sqrt(1 - r2);
+    double y = sin(2 * M_PI * r1) * sqrt(1 - r2);
+    double z = sqrt(r2);
+
+    int iMin = 0;
+    double min = abs(N[0]);
+    for (int i = 1; i < 3; i++)
+    {
+        if (abs(N[i]) < min)
+        {
+            min = abs(N[i]);
+            iMin = i;
+        }
+    }
+
+    Vector T1;
+    if (iMin == 0)
+        T1 = Vector(0, N[2], -N[1]);
+    else if (iMin == 1)
+        T1 = Vector(N[2], 0, -N[0]);
+    else if (iMin == 2)
+        T1 = Vector(N[1], -N[0], 0);
+    T1.normalize();
+
+    Vector T2 = cross(T1, N);
+
+    return T1 * x + T2 * y + N * z;
+}
+
 class Scene
 {
 public:
@@ -135,7 +172,8 @@ public:
     double alpha;
     Vector l_pos;
     double l_int;
-    Scene(const Vector &camera_position, int height, int width, double angle, Vector light_position, double light_intensity)
+    double l_rad;
+    Scene(const Vector &camera_position, int height, int width, double angle, Vector light_position, double light_intensity, double light_radius)
     {
         cam_pos = camera_position;
         H = height;
@@ -143,6 +181,7 @@ public:
         alpha = angle;
         l_pos = light_position;
         l_int = light_intensity;
+        l_rad = light_radius;
     }
     void add_sphere(const Sphere &sphere)
     {
@@ -151,6 +190,11 @@ public:
 
     Vector get_pixel_color(const Ray &ray, int num_reflex = 0)
     {
+        if (num_reflex > 5)
+        {
+            return Vector(0., 0., 0.);
+        }
+        Vector Lo(0., 0., 0.);
         double t = -1.;
         int sphere_index;
         for (int i = 0; i < S_list.size(); i++)
@@ -174,42 +218,44 @@ public:
             P = P + epsilon * N;
             if (S_list[sphere_index].m == true)
             {
-                if (num_reflex < 2)
-                {
-                    Vector reflection_direction = ray.u - 2 * (dot(ray.u, N)) * N;
-                    return get_pixel_color(Ray(P, reflection_direction), num_reflex + 1);
-                }
-                else
-                {
-                    return (Vector(0., 0., 0.));
-                }
-            }
-            bool intersect = false;
-            for (int i = 0; i < S_list.size(); i++)
-            {
-                Vector point_to_light = l_pos - P;
-                point_to_light.normalize();
-                double point_to_light_intersect = S_list[i].check_intersect(Ray(P, point_to_light));
-                if ((point_to_light_intersect >= 0) && (point_to_light_intersect < (l_pos - P).norm()))
-                {
-                    intersect = true;
-                    break;
-                }
-            }
-            if (intersect == false)
-            {
-
-                double color1 = l_int / (4 * M_PI * (l_pos - P).norm2());
-                Vector color2 = S_list[sphere_index].Alb / M_PI;
-                double color3 = dot(N, (l_pos - P) / (l_pos - P).norm());
-                Vector final_color = color1 * color2 * color3;
-                return final_color;
+                Vector reflection_direction = ray.u - 2 * (dot(ray.u, N)) * N;
+                return get_pixel_color(Ray(P, reflection_direction), num_reflex + 1);
             }
             else
             {
-                return Vector(0, 0, 0);
+                double visibility = 1.;
+                for (int i = 0; i < S_list.size(); i++)
+                {
+                    Vector point_to_light = l_pos - P;
+                    point_to_light.normalize();
+                    double point_to_light_intersect = S_list[i].check_intersect(Ray(P, point_to_light));
+                    if ((point_to_light_intersect >= 0) && (point_to_light_intersect < (l_pos - P).norm()))
+                    {
+                        visibility = 0.;
+                        break;
+                    }
+                }
+                double I = l_int;
+                double R = l_rad;
+                Vector x = S_list[sphere_index].C;
+                Vector x_to_light = x - l_pos;
+                x_to_light.normalize();
+                Vector xprime = R * randomCos(x_to_light) + l_pos;
+                Vector Nprime = xprime - l_pos;
+                Nprime.normalize();
+                double d = (xprime - P).norm();
+                Vector omega = xprime - P;
+                omega.normalize();
+                Ray myLightRay = Ray(P, omega);
+                double pdf = dot(Nprime, x_to_light) / (M_PI * R * R);
+                Vector rho = S_list[sphere_index].Alb;
+                Lo = I / pow(2 * M_PI * R, 2) * rho / M_PI * visibility * std::max(dot(N, omega), 0.) * std::max(dot(Nprime, (-1.) * omega), 0.) / (pow((xprime - P).norm(), 2) * pdf);
+
+                Ray myRandomRay = Ray(P, randomCos(N));
+                Lo = Lo + rho * get_pixel_color(myRandomRay, num_reflex + 1);
             }
         }
+        return Lo;
     }
     void render(std::vector<unsigned char> &image)
     {
@@ -217,14 +263,20 @@ public:
         {
             for (int j = 0; j < W; j++)
             {
-                double x_ray = j - double(W) / 2. + 0.5;
-                double y_ray = double(H) / 2. - i - 0.5;
-                double z_ray = -W / (2. * tan(alpha / 2.));
+                Vector total_color(0., 0., 0.);
+                for (int num_ray = 0; num_ray < 100; num_ray++)
+                {
+                    double x_ray = j - double(W) / 2. + 0.5;
+                    double y_ray = double(H) / 2. - i - 0.5;
+                    double z_ray = -W / (2. * tan(alpha / 2.));
 
-                Vector direction_to_pixel = Vector(x_ray, y_ray, z_ray);
-                direction_to_pixel.normalize();
-                Vector output_color = get_pixel_color(Ray(cam_pos, direction_to_pixel));
-                Vector gamma_color = gamma_correction(output_color);
+                    Vector direction_to_pixel = Vector(x_ray, y_ray, z_ray);
+                    direction_to_pixel.normalize();
+                    Vector output_color = get_pixel_color(Ray(cam_pos, direction_to_pixel));
+                    total_color = total_color + output_color;
+                }
+                Vector average_color = total_color / 100.;
+                Vector gamma_color = gamma_correction(average_color);
 
                 image[(i * W + j) * 3 + 0] = gamma_color[0];
                 image[(i * W + j) * 3 + 1] = gamma_color[1];
@@ -236,8 +288,8 @@ public:
 
 int main()
 {
-    int W = 512;
-    int H = 512;
+    int W = 64;
+    int H = 64;
 
     // std::vector<unsigned char> image(W * H * 3, 0);
     // for (int i = 0; i < H; i++)
@@ -252,7 +304,7 @@ int main()
     // }
 
     // return 0;
-    Scene scene = Scene(Vector(0, 0, 55), 512, 512, M_PI / 3., Vector(-10, 20, 40), 1e10);
+    Scene scene = Scene(Vector(0, 0, 55), W, H, M_PI / 3., Vector(-10, 20, 40), 1e10, 3.);
     scene.add_sphere(Sphere(10, Vector(-20, 0, 0), Vector(1., 1., 1.)));
     scene.add_sphere(Sphere(10, Vector(0, 0, 0), Vector(1., 1., 1.), true));
     scene.add_sphere(Sphere(10, Vector(20, 0, 0), Vector(1., 1., 1.)));
@@ -266,5 +318,5 @@ int main()
     std::vector<unsigned char> image(W * H * 3, 0);
 
     scene.render(image);
-    stbi_write_png("image.png", W, H, 3, &image[0], 0);
+    stbi_write_png("image_small.png", W, H, 3, &image[0], 0);
 }
