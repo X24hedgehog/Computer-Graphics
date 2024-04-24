@@ -8,9 +8,28 @@
 #include "stb_image.h"
 
 #include <math.h>
+#include <ctime>
+#include <iostream>
 #define M_PI 3.14159265358979323846
 
+#include <string>
+#include <stdio.h>
+#include <algorithm>
+#include <random>
+#include <omp.h>
+
 double epsilon = 1e-9;
+int num_ray_max = 5;
+int num_reflect_max = 2;
+
+double double_rand()
+{
+    static thread_local std::mt19937 *generator = nullptr;
+    if (!generator)
+        generator = new std::mt19937(clock() + omp_get_thread_num());
+    std::uniform_real_distribution<double> distribution(0.0, 1.0);
+    return distribution(*generator);
+}
 
 class Vector
 {
@@ -90,24 +109,478 @@ public:
     }
 };
 
-class Sphere
+class Geometry
+{
+public:
+    Vector Alb;
+    bool m;
+    Geometry(Vector Albedo, bool IsMirror)
+    {
+        Alb = Albedo;
+        m = IsMirror;
+    }
+    virtual double check_intersect(const Ray &ray, Vector &N) = 0;
+};
+
+class TriangleIndices
+{
+public:
+    TriangleIndices(int vtxi = -1, int vtxj = -1, int vtxk = -1, int ni = -1, int nj = -1, int nk = -1, int uvi = -1, int uvj = -1, int uvk = -1, int group = -1, bool added = false) : vtxi(vtxi), vtxj(vtxj), vtxk(vtxk), uvi(uvi), uvj(uvj), uvk(uvk), ni(ni), nj(nj), nk(nk), group(group){};
+    int vtxi, vtxj, vtxk; // indices within the vertex coordinates array
+    int uvi, uvj, uvk;    // indices within the uv coordinates array
+    int ni, nj, nk;       // indices within the normals array
+    int group;            // face group
+};
+
+class TriangleMesh : public Geometry
+{
+public:
+    TriangleMesh(Vector Albedo, bool IsMirror = false) : Geometry(Albedo, IsMirror)
+    {
+    }
+
+    double check_intersect_triangle(const Ray &ray, TriangleIndices &indice, Vector &final_N)
+    {
+        Vector origin = ray.O;
+        Vector direction = ray.u;
+        Vector A = vertices[indice.vtxi];
+        Vector B = vertices[indice.vtxj];
+        Vector C = vertices[indice.vtxk];
+        Vector e1 = B - A;
+        Vector e2 = C - A;
+        Vector N = cross(e1, e2);
+        double beta = dot(e2, cross(A - origin, direction)) / dot(direction, N);
+        double gamma = -1 * dot(e1, cross(A - origin, direction)) / dot(direction, N);
+        double alpha = 1 - beta - gamma;
+
+        if (beta < 0 || gamma < 0 || alpha < 0)
+        {
+            return -1;
+        }
+
+        double t = dot(A - origin, N) / dot(direction, N);
+        if (t < 0)
+        {
+            return -1;
+        }
+        N.normalize();
+        final_N = N;
+        return t;
+
+        // double delta = pow(dot(ray.u, ray.O - C), 2) - (ray.O - C).norm2() + pow(R, 2);
+        // if (delta >= 0)
+        // {
+        //     double t1 = dot(ray.u, C - ray.O) + sqrt(delta);
+        //     double t2 = dot(ray.u, C - ray.O) - sqrt(delta);
+        //     if (t2 >= 0)
+        //     {
+        //         Vector P = ray.O + t2 * ray.u;
+        //         N = P - C;
+        //         N.normalize();
+        //         return t2;
+        //     }
+        //     else
+        //     {
+        //         if (t1 >= 0)
+        //         {
+        //             Vector P = ray.O + t1 * ray.u;
+        //             N = P - C;
+        //             N.normalize();
+        //             return t1;
+        //         }
+        //     }
+        // }
+        // return -1.;
+    }
+
+    double check_intersect(const Ray &ray, Vector &N) override
+    {
+        double t = -1;
+        double temp;
+        TriangleIndices object;
+        Vector N_temp;
+        for (int i = 0; i < indices.size(); i++)
+        {
+            temp = check_intersect_triangle(ray, indices[i], N_temp);
+            if ((t < 0) || (temp > 0 && temp < t))
+            {
+                t = temp;
+                N = N_temp;
+            }
+        }
+        return t;
+    }
+
+    void readOBJ(const char *obj)
+    {
+
+        char matfile[255];
+        char grp[255];
+
+        FILE *f;
+        f = fopen(obj, "r");
+        int curGroup = -1;
+        while (!feof(f))
+        {
+            char line[255];
+            if (!fgets(line, 255, f))
+                break;
+
+            std::string linetrim(line);
+            linetrim.erase(linetrim.find_last_not_of(" \r\t") + 1);
+            strcpy(line, linetrim.c_str());
+
+            if (line[0] == 'u' && line[1] == 's')
+            {
+                sscanf(line, "usemtl %[^\n]\n", grp);
+                curGroup++;
+            }
+
+            if (line[0] == 'v' && line[1] == ' ')
+            {
+                Vector vec;
+
+                Vector col;
+                if (sscanf(line, "v %lf %lf %lf %lf %lf %lf\n", &vec[0], &vec[1], &vec[2], &col[0], &col[1], &col[2]) == 6)
+                {
+                    col[0] = std::min(1., std::max(0., col[0]));
+                    col[1] = std::min(1., std::max(0., col[1]));
+                    col[2] = std::min(1., std::max(0., col[2]));
+
+                    vertices.push_back(vec);
+                    vertexcolors.push_back(col);
+                }
+                else
+                {
+                    sscanf(line, "v %lf %lf %lf\n", &vec[0], &vec[1], &vec[2]);
+                    vec = vec * 0.8 + Vector(0, -10, 0);
+                    vertices.push_back(vec);
+                }
+            }
+            if (line[0] == 'v' && line[1] == 'n')
+            {
+                Vector vec;
+                sscanf(line, "vn %lf %lf %lf\n", &vec[0], &vec[1], &vec[2]);
+                normals.push_back(vec);
+            }
+            if (line[0] == 'v' && line[1] == 't')
+            {
+                Vector vec;
+                sscanf(line, "vt %lf %lf\n", &vec[0], &vec[1]);
+                uvs.push_back(vec);
+            }
+            if (line[0] == 'f')
+            {
+                TriangleIndices t;
+                int i0, i1, i2, i3;
+                int j0, j1, j2, j3;
+                int k0, k1, k2, k3;
+                int nn;
+                t.group = curGroup;
+
+                char *consumedline = line + 1;
+                int offset;
+
+                nn = sscanf(consumedline, "%u/%u/%u %u/%u/%u %u/%u/%u%n", &i0, &j0, &k0, &i1, &j1, &k1, &i2, &j2, &k2, &offset);
+                if (nn == 9)
+                {
+                    if (i0 < 0)
+                        t.vtxi = vertices.size() + i0;
+                    else
+                        t.vtxi = i0 - 1;
+                    if (i1 < 0)
+                        t.vtxj = vertices.size() + i1;
+                    else
+                        t.vtxj = i1 - 1;
+                    if (i2 < 0)
+                        t.vtxk = vertices.size() + i2;
+                    else
+                        t.vtxk = i2 - 1;
+                    if (j0 < 0)
+                        t.uvi = uvs.size() + j0;
+                    else
+                        t.uvi = j0 - 1;
+                    if (j1 < 0)
+                        t.uvj = uvs.size() + j1;
+                    else
+                        t.uvj = j1 - 1;
+                    if (j2 < 0)
+                        t.uvk = uvs.size() + j2;
+                    else
+                        t.uvk = j2 - 1;
+                    if (k0 < 0)
+                        t.ni = normals.size() + k0;
+                    else
+                        t.ni = k0 - 1;
+                    if (k1 < 0)
+                        t.nj = normals.size() + k1;
+                    else
+                        t.nj = k1 - 1;
+                    if (k2 < 0)
+                        t.nk = normals.size() + k2;
+                    else
+                        t.nk = k2 - 1;
+                    indices.push_back(t);
+                }
+                else
+                {
+                    nn = sscanf(consumedline, "%u/%u %u/%u %u/%u%n", &i0, &j0, &i1, &j1, &i2, &j2, &offset);
+                    if (nn == 6)
+                    {
+                        if (i0 < 0)
+                            t.vtxi = vertices.size() + i0;
+                        else
+                            t.vtxi = i0 - 1;
+                        if (i1 < 0)
+                            t.vtxj = vertices.size() + i1;
+                        else
+                            t.vtxj = i1 - 1;
+                        if (i2 < 0)
+                            t.vtxk = vertices.size() + i2;
+                        else
+                            t.vtxk = i2 - 1;
+                        if (j0 < 0)
+                            t.uvi = uvs.size() + j0;
+                        else
+                            t.uvi = j0 - 1;
+                        if (j1 < 0)
+                            t.uvj = uvs.size() + j1;
+                        else
+                            t.uvj = j1 - 1;
+                        if (j2 < 0)
+                            t.uvk = uvs.size() + j2;
+                        else
+                            t.uvk = j2 - 1;
+                        indices.push_back(t);
+                    }
+                    else
+                    {
+                        nn = sscanf(consumedline, "%u %u %u%n", &i0, &i1, &i2, &offset);
+                        if (nn == 3)
+                        {
+                            if (i0 < 0)
+                                t.vtxi = vertices.size() + i0;
+                            else
+                                t.vtxi = i0 - 1;
+                            if (i1 < 0)
+                                t.vtxj = vertices.size() + i1;
+                            else
+                                t.vtxj = i1 - 1;
+                            if (i2 < 0)
+                                t.vtxk = vertices.size() + i2;
+                            else
+                                t.vtxk = i2 - 1;
+                            indices.push_back(t);
+                        }
+                        else
+                        {
+                            nn = sscanf(consumedline, "%u//%u %u//%u %u//%u%n", &i0, &k0, &i1, &k1, &i2, &k2, &offset);
+                            if (i0 < 0)
+                                t.vtxi = vertices.size() + i0;
+                            else
+                                t.vtxi = i0 - 1;
+                            if (i1 < 0)
+                                t.vtxj = vertices.size() + i1;
+                            else
+                                t.vtxj = i1 - 1;
+                            if (i2 < 0)
+                                t.vtxk = vertices.size() + i2;
+                            else
+                                t.vtxk = i2 - 1;
+                            if (k0 < 0)
+                                t.ni = normals.size() + k0;
+                            else
+                                t.ni = k0 - 1;
+                            if (k1 < 0)
+                                t.nj = normals.size() + k1;
+                            else
+                                t.nj = k1 - 1;
+                            if (k2 < 0)
+                                t.nk = normals.size() + k2;
+                            else
+                                t.nk = k2 - 1;
+                            indices.push_back(t);
+                        }
+                    }
+                }
+
+                consumedline = consumedline + offset;
+
+                while (true)
+                {
+                    if (consumedline[0] == '\n')
+                        break;
+                    if (consumedline[0] == '\0')
+                        break;
+                    nn = sscanf(consumedline, "%u/%u/%u%n", &i3, &j3, &k3, &offset);
+                    TriangleIndices t2;
+                    t2.group = curGroup;
+                    if (nn == 3)
+                    {
+                        if (i0 < 0)
+                            t2.vtxi = vertices.size() + i0;
+                        else
+                            t2.vtxi = i0 - 1;
+                        if (i2 < 0)
+                            t2.vtxj = vertices.size() + i2;
+                        else
+                            t2.vtxj = i2 - 1;
+                        if (i3 < 0)
+                            t2.vtxk = vertices.size() + i3;
+                        else
+                            t2.vtxk = i3 - 1;
+                        if (j0 < 0)
+                            t2.uvi = uvs.size() + j0;
+                        else
+                            t2.uvi = j0 - 1;
+                        if (j2 < 0)
+                            t2.uvj = uvs.size() + j2;
+                        else
+                            t2.uvj = j2 - 1;
+                        if (j3 < 0)
+                            t2.uvk = uvs.size() + j3;
+                        else
+                            t2.uvk = j3 - 1;
+                        if (k0 < 0)
+                            t2.ni = normals.size() + k0;
+                        else
+                            t2.ni = k0 - 1;
+                        if (k2 < 0)
+                            t2.nj = normals.size() + k2;
+                        else
+                            t2.nj = k2 - 1;
+                        if (k3 < 0)
+                            t2.nk = normals.size() + k3;
+                        else
+                            t2.nk = k3 - 1;
+                        indices.push_back(t2);
+                        consumedline = consumedline + offset;
+                        i2 = i3;
+                        j2 = j3;
+                        k2 = k3;
+                    }
+                    else
+                    {
+                        nn = sscanf(consumedline, "%u/%u%n", &i3, &j3, &offset);
+                        if (nn == 2)
+                        {
+                            if (i0 < 0)
+                                t2.vtxi = vertices.size() + i0;
+                            else
+                                t2.vtxi = i0 - 1;
+                            if (i2 < 0)
+                                t2.vtxj = vertices.size() + i2;
+                            else
+                                t2.vtxj = i2 - 1;
+                            if (i3 < 0)
+                                t2.vtxk = vertices.size() + i3;
+                            else
+                                t2.vtxk = i3 - 1;
+                            if (j0 < 0)
+                                t2.uvi = uvs.size() + j0;
+                            else
+                                t2.uvi = j0 - 1;
+                            if (j2 < 0)
+                                t2.uvj = uvs.size() + j2;
+                            else
+                                t2.uvj = j2 - 1;
+                            if (j3 < 0)
+                                t2.uvk = uvs.size() + j3;
+                            else
+                                t2.uvk = j3 - 1;
+                            consumedline = consumedline + offset;
+                            i2 = i3;
+                            j2 = j3;
+                            indices.push_back(t2);
+                        }
+                        else
+                        {
+                            nn = sscanf(consumedline, "%u//%u%n", &i3, &k3, &offset);
+                            if (nn == 2)
+                            {
+                                if (i0 < 0)
+                                    t2.vtxi = vertices.size() + i0;
+                                else
+                                    t2.vtxi = i0 - 1;
+                                if (i2 < 0)
+                                    t2.vtxj = vertices.size() + i2;
+                                else
+                                    t2.vtxj = i2 - 1;
+                                if (i3 < 0)
+                                    t2.vtxk = vertices.size() + i3;
+                                else
+                                    t2.vtxk = i3 - 1;
+                                if (k0 < 0)
+                                    t2.ni = normals.size() + k0;
+                                else
+                                    t2.ni = k0 - 1;
+                                if (k2 < 0)
+                                    t2.nj = normals.size() + k2;
+                                else
+                                    t2.nj = k2 - 1;
+                                if (k3 < 0)
+                                    t2.nk = normals.size() + k3;
+                                else
+                                    t2.nk = k3 - 1;
+                                consumedline = consumedline + offset;
+                                i2 = i3;
+                                k2 = k3;
+                                indices.push_back(t2);
+                            }
+                            else
+                            {
+                                nn = sscanf(consumedline, "%u%n", &i3, &offset);
+                                if (nn == 1)
+                                {
+                                    if (i0 < 0)
+                                        t2.vtxi = vertices.size() + i0;
+                                    else
+                                        t2.vtxi = i0 - 1;
+                                    if (i2 < 0)
+                                        t2.vtxj = vertices.size() + i2;
+                                    else
+                                        t2.vtxj = i2 - 1;
+                                    if (i3 < 0)
+                                        t2.vtxk = vertices.size() + i3;
+                                    else
+                                        t2.vtxk = i3 - 1;
+                                    consumedline = consumedline + offset;
+                                    i2 = i3;
+                                    indices.push_back(t2);
+                                }
+                                else
+                                {
+                                    consumedline = consumedline + 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        fclose(f);
+    }
+
+    std::vector<TriangleIndices> indices;
+    std::vector<Vector> vertices;
+    std::vector<Vector> normals;
+    std::vector<Vector> uvs;
+    std::vector<Vector> vertexcolors;
+};
+
+class Sphere : public Geometry
 {
 public:
     double R;
     Vector C;
-    Vector Alb;
-    bool m;
-    Sphere(double Radius, Vector Center, Vector Albedo, bool IsMirror = false)
+    Sphere(double Radius, Vector Center, Vector Albedo, bool IsMirror = false) : Geometry(Albedo, IsMirror)
     {
         R = Radius;
         C = Center;
-        Alb = Albedo;
-        m = IsMirror;
     }
 
-    double check_intersect(const Ray &ray)
+    double check_intersect(const Ray &ray, Vector &N) override
     {
-        double t = -1.;
         double delta = pow(dot(ray.u, ray.O - C), 2) - (ray.O - C).norm2() + pow(R, 2);
         if (delta >= 0)
         {
@@ -115,24 +588,30 @@ public:
             double t2 = dot(ray.u, C - ray.O) - sqrt(delta);
             if (t2 >= 0)
             {
+                Vector P = ray.O + t2 * ray.u;
+                N = P - C;
+                N.normalize();
                 return t2;
             }
             else
             {
                 if (t1 >= 0)
                 {
+                    Vector P = ray.O + t1 * ray.u;
+                    N = P - C;
+                    N.normalize();
                     return t1;
                 }
             }
         }
-        return t;
+        return -1.;
     }
 };
 
 Vector randomCos(const Vector &N)
 {
-    double r1 = ((double)rand() / (RAND_MAX));
-    double r2 = ((double)rand() / (RAND_MAX));
+    double r1 = double_rand();
+    double r2 = double_rand();
     double x = cos(2 * M_PI * r1) * sqrt(1 - r2);
     double y = sin(2 * M_PI * r1) * sqrt(1 - r2);
     double z = sqrt(r2);
@@ -165,7 +644,7 @@ Vector randomCos(const Vector &N)
 class Scene
 {
 public:
-    std::vector<Sphere> S_list;
+    std::vector<Geometry *> G_list;
     Vector cam_pos;
     int H;
     int W;
@@ -183,27 +662,29 @@ public:
         l_int = light_intensity;
         l_rad = light_radius;
     }
-    void add_sphere(const Sphere &sphere)
+    void add_geometry(Geometry *object_pointer)
     {
-        S_list.push_back(sphere);
+        G_list.push_back(object_pointer);
     }
 
     Vector get_pixel_color(const Ray &ray, int num_reflex = 0)
     {
-        if (num_reflex > 5)
+        if (num_reflex >= num_reflect_max)
         {
             return Vector(0., 0., 0.);
         }
         Vector Lo(0., 0., 0.);
         double t = -1.;
-        int sphere_index;
-        for (int i = 0; i < S_list.size(); i++)
+        Vector N_temp, N;
+        int object_index;
+        for (int i = 0; i < G_list.size(); i++)
         {
-            double temp = S_list[i].check_intersect(ray);
+            double temp = G_list[i]->check_intersect(ray, N_temp);
             if ((t < 0) || (temp > 0 && temp < t))
             {
                 t = temp;
-                sphere_index = i;
+                object_index = i;
+                N = N_temp;
             }
         }
         if (t < 0)
@@ -213,10 +694,10 @@ public:
         else
         {
             Vector P = ray.O + t * ray.u;
-            Vector N = P - S_list[sphere_index].C;
+            // Vector N = P - S_list[sphere_index].C;
             N.normalize();
             P = P + epsilon * N;
-            if (S_list[sphere_index].m == true)
+            if (G_list[object_index]->m == true)
             {
                 Vector reflection_direction = ray.u - 2 * (dot(ray.u, N)) * N;
                 return get_pixel_color(Ray(P, reflection_direction), num_reflex + 1);
@@ -224,47 +705,58 @@ public:
             else
             {
                 double visibility = 1.;
-                for (int i = 0; i < S_list.size(); i++)
+                for (int i = 0; i < G_list.size(); i++)
                 {
                     Vector point_to_light = l_pos - P;
                     point_to_light.normalize();
-                    double point_to_light_intersect = S_list[i].check_intersect(Ray(P, point_to_light));
+                    double point_to_light_intersect = G_list[i]->check_intersect(Ray(P, point_to_light), N_temp);
                     if ((point_to_light_intersect >= 0) && (point_to_light_intersect < (l_pos - P).norm()))
                     {
+                        // std::cout << i;
                         visibility = 0.;
                         break;
                     }
                 }
+                // std::cout << '1';
+                // Lo = (visibility) ? Vector(255., 0., 0.) : Vector(0., 255., 0.);
                 double I = l_int;
-                double R = l_rad;
-                Vector x = S_list[sphere_index].C;
-                Vector x_to_light = x - l_pos;
-                x_to_light.normalize();
-                Vector xprime = R * randomCos(x_to_light) + l_pos;
-                Vector Nprime = xprime - l_pos;
-                Nprime.normalize();
-                double d = (xprime - P).norm();
-                Vector omega = xprime - P;
-                omega.normalize();
-                Ray myLightRay = Ray(P, omega);
-                double pdf = dot(Nprime, x_to_light) / (M_PI * R * R);
-                Vector rho = S_list[sphere_index].Alb;
-                Lo = I / pow(2 * M_PI * R, 2) * rho / M_PI * visibility * std::max(dot(N, omega), 0.) * std::max(dot(Nprime, (-1.) * omega), 0.) / (pow((xprime - P).norm(), 2) * pdf);
+                Vector l_dir = l_pos - P;
+                l_dir.normalize();
+                double component1 = I / (4 * M_PI * (l_pos - P).norm2());
+                Vector component2 = G_list[object_index]->Alb / M_PI;
+                double component3 = dot(N, l_dir);
+                Lo = gamma_correction(component1 * component2 * component3) * visibility;
+
+                // double I = l_int;
+                // double R = l_rad;
+                // Vector x = G_list[object_index]->C;
+                // Vector x_to_light = x - l_pos;
+                // x_to_light.normalize();
+                // Vector xprime = R * randomCos(x_to_light) + l_pos;
+                // Vector Nprime = xprime - l_pos;
+                // Nprime.normalize();
+                // double d = (xprime - P).norm();
+                // Vector omega = xprime - P;
+                // omega.normalize();
+                // double pdf = dot(Nprime, x_to_light) / (M_PI * R * R);
+                // Vector rho = S_list[sphere_index].Alb;
+                // Lo = I / pow(2 * M_PI * R, 2) * rho / M_PI * visibility * std::max(dot(N, omega), 0.) * std::max(dot(Nprime, (-1.) * omega), 0.) / (pow((xprime - P).norm(), 2) * pdf);
 
                 Ray myRandomRay = Ray(P, randomCos(N));
-                Lo = Lo + rho * get_pixel_color(myRandomRay, num_reflex + 1);
+                return Lo + G_list[object_index]->Alb * get_pixel_color(myRandomRay, num_reflex + 1);
             }
         }
-        return Lo;
     }
+
     void render(std::vector<unsigned char> &image)
     {
+#pragma omp parallel for schedule(dynamic, 1)
         for (int i = 0; i < H; i++)
         {
             for (int j = 0; j < W; j++)
             {
                 Vector total_color(0., 0., 0.);
-                for (int num_ray = 0; num_ray < 100; num_ray++)
+                for (int num_ray = 0; num_ray < num_ray_max; num_ray++)
                 {
                     double x_ray = j - double(W) / 2. + 0.5;
                     double y_ray = double(H) / 2. - i - 0.5;
@@ -275,12 +767,13 @@ public:
                     Vector output_color = get_pixel_color(Ray(cam_pos, direction_to_pixel));
                     total_color = total_color + output_color;
                 }
-                Vector average_color = total_color / 100.;
-                Vector gamma_color = gamma_correction(average_color);
+                // std::cout << total_color[0] << ' ' << total_color[1] << ' ' << total_color[2] << std::endl;
+                Vector average_color = total_color / num_ray_max;
+                // Vector gamma_color = gamma_correction(average_color);
 
-                image[(i * W + j) * 3 + 0] = gamma_color[0];
-                image[(i * W + j) * 3 + 1] = gamma_color[1];
-                image[(i * W + j) * 3 + 2] = gamma_color[2];
+                image[(i * W + j) * 3 + 0] = std::min(255., average_color[0]);
+                image[(i * W + j) * 3 + 1] = std::min(255., average_color[1]);
+                image[(i * W + j) * 3 + 2] = std::min(255., average_color[2]);
             }
         }
     }
@@ -288,8 +781,10 @@ public:
 
 int main()
 {
-    int W = 64;
-    int H = 64;
+    int W = 512;
+    int H = 512;
+    time_t start, end;
+    std::time(&start);
 
     // std::vector<unsigned char> image(W * H * 3, 0);
     // for (int i = 0; i < H; i++)
@@ -305,18 +800,29 @@ int main()
 
     // return 0;
     Scene scene = Scene(Vector(0, 0, 55), W, H, M_PI / 3., Vector(-10, 20, 40), 1e10, 3.);
-    scene.add_sphere(Sphere(10, Vector(-20, 0, 0), Vector(1., 1., 1.)));
-    scene.add_sphere(Sphere(10, Vector(0, 0, 0), Vector(1., 1., 1.), true));
-    scene.add_sphere(Sphere(10, Vector(20, 0, 0), Vector(1., 1., 1.)));
-    scene.add_sphere(Sphere(940, Vector(0, 0, 1000), Vector(1., 0., 1.)));
-    scene.add_sphere(Sphere(940, Vector(0, 1000, 0), Vector(1., 0., 0.)));
-    scene.add_sphere(Sphere(940., Vector(0, 0, -1000), Vector(0., 1., 0.)));
-    scene.add_sphere(Sphere(990., Vector(0, -1000, 0), Vector(0., 0., 1.)));
-    scene.add_sphere(Sphere(940., Vector(-1000, 0, 0), Vector(0., 1., 1.)));
-    scene.add_sphere(Sphere(940., Vector(1000, 0, 0), Vector(1., 1., 0.)));
+    std::vector<Sphere> object_list;
+    TriangleMesh Cat = TriangleMesh(Vector(0.3, 0.3, 0.3), false);
+    Cat.readOBJ("cat.obj");
+    // object_list.push_back(Sphere(10, Vector(-20, 0, 0), Vector(1., 1., 1.)));
+    // object_list.push_back(Sphere(10, Vector(0, 0, 0), Vector(1., 1., 1.), false));
+    // object_list.push_back(Sphere(10, Vector(20, 0, 0), Vector(1., 1., 1.)));
+    object_list.push_back(Sphere(940, Vector(0, 0, 1000), Vector(1., 0., 1.)));
+    object_list.push_back(Sphere(940, Vector(0, 1000, 0), Vector(1., 0., 0.)));
+    object_list.push_back(Sphere(940., Vector(0, 0, -1000), Vector(0., 1., 0.)));
+    object_list.push_back(Sphere(990., Vector(0, -1000, 0), Vector(0., 0., 1.)));
+    object_list.push_back(Sphere(940., Vector(-1000, 0, 0), Vector(0., 1., 1.)));
+    object_list.push_back(Sphere(940., Vector(1000, 0, 0), Vector(1., 1., 0.)));
+
+    for (int i = 0; i < object_list.size(); i++)
+    {
+        scene.add_geometry(&object_list[i]);
+    }
+    scene.add_geometry(&Cat);
 
     std::vector<unsigned char> image(W * H * 3, 0);
 
     scene.render(image);
-    stbi_write_png("image_small.png", W, H, 3, &image[0], 0);
+    stbi_write_png("image5.png", W, H, 3, &image[0], 0);
+    std::time(&end);
+    std::cout << end - start << std::endl;
 }
