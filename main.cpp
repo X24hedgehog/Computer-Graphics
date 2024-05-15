@@ -19,8 +19,8 @@
 #include <omp.h>
 
 double epsilon = 1e-9;
-int num_ray_max = 5;
-int num_reflect_max = 2;
+int num_ray_max = 2;
+int num_reflect_max = 20; // directlighting: 1
 
 double double_rand()
 {
@@ -132,6 +132,54 @@ public:
     int group;            // face group
 };
 
+class BoundingBox
+{
+public:
+    BoundingBox()
+    {
+    }
+
+    Vector verticemin = Vector(INT_MAX, INT_MAX, INT_MAX);
+    Vector verticemax = -1 * Vector(INT_MAX, INT_MAX, INT_MAX);
+
+    void change_bound(std::vector<Vector> &indice_list)
+    {
+        for (int i = 0; i < indice_list.size(); i++)
+        {
+            for (int j = 0; j < 3; j++)
+            {
+                if (indice_list[i][j] > verticemax[j])
+                {
+                    verticemax[j] = indice_list[i][j];
+                }
+                else if (indice_list[i][j] < verticemin[j])
+                {
+                    verticemin[j] = indice_list[i][j];
+                }
+            }
+        }
+    }
+
+    bool check_intersect(const Ray &ray)
+    {
+        Vector left_bound, right_bound;
+        for (int i = 0; i < 3; i++)
+        {
+            left_bound[i] = (verticemin[i] - ray.O[i]) / ray.u[i];
+            right_bound[i] = (verticemax[i] - ray.O[i]) / ray.u[i];
+            if (left_bound[i] > right_bound[i])
+            {
+                double temp = right_bound[i];
+                right_bound[i] = left_bound[i];
+                left_bound[i] = temp;
+            }
+        }
+        double min_bound = std::max<double>(std::max<double>(left_bound[0], left_bound[1]), left_bound[2]);
+        double max_bound = std::min<double>(std::min<double>(right_bound[0], right_bound[1]), right_bound[2]);
+        return (min_bound < max_bound && max_bound > 0);
+    }
+};
+
 class TriangleMesh : public Geometry
 {
 public:
@@ -166,35 +214,12 @@ public:
         N.normalize();
         final_N = N;
         return t;
-
-        // double delta = pow(dot(ray.u, ray.O - C), 2) - (ray.O - C).norm2() + pow(R, 2);
-        // if (delta >= 0)
-        // {
-        //     double t1 = dot(ray.u, C - ray.O) + sqrt(delta);
-        //     double t2 = dot(ray.u, C - ray.O) - sqrt(delta);
-        //     if (t2 >= 0)
-        //     {
-        //         Vector P = ray.O + t2 * ray.u;
-        //         N = P - C;
-        //         N.normalize();
-        //         return t2;
-        //     }
-        //     else
-        //     {
-        //         if (t1 >= 0)
-        //         {
-        //             Vector P = ray.O + t1 * ray.u;
-        //             N = P - C;
-        //             N.normalize();
-        //             return t1;
-        //         }
-        //     }
-        // }
-        // return -1.;
     }
 
     double check_intersect(const Ray &ray, Vector &N) override
     {
+        // if (box.check_intersect(ray))
+        // {
         double t = -1;
         double temp;
         TriangleIndices object;
@@ -209,6 +234,8 @@ public:
             }
         }
         return t;
+        // }
+        // return -1;
     }
 
     void readOBJ(const char *obj)
@@ -559,6 +586,7 @@ public:
             }
         }
         fclose(f);
+        box.change_bound(vertices);
     }
 
     std::vector<TriangleIndices> indices;
@@ -566,6 +594,7 @@ public:
     std::vector<Vector> normals;
     std::vector<Vector> uvs;
     std::vector<Vector> vertexcolors;
+    BoundingBox box;
 };
 
 class Sphere : public Geometry
@@ -803,9 +832,9 @@ int main()
     std::vector<Sphere> object_list;
     TriangleMesh Cat = TriangleMesh(Vector(0.3, 0.3, 0.3), false);
     Cat.readOBJ("cat.obj");
-    // object_list.push_back(Sphere(10, Vector(-20, 0, 0), Vector(1., 1., 1.)));
-    // object_list.push_back(Sphere(10, Vector(0, 0, 0), Vector(1., 1., 1.), false));
-    // object_list.push_back(Sphere(10, Vector(20, 0, 0), Vector(1., 1., 1.)));
+    object_list.push_back(Sphere(10, Vector(-20, 0, 0), Vector(1., 1., 1.)));
+    object_list.push_back(Sphere(10, Vector(0, 0, 0), Vector(1., 1., 1.), true));
+    object_list.push_back(Sphere(10, Vector(20, 0, 0), Vector(1., 1., 1.)));
     object_list.push_back(Sphere(940, Vector(0, 0, 1000), Vector(1., 0., 1.)));
     object_list.push_back(Sphere(940, Vector(0, 1000, 0), Vector(1., 0., 0.)));
     object_list.push_back(Sphere(940., Vector(0, 0, -1000), Vector(0., 1., 0.)));
@@ -817,12 +846,12 @@ int main()
     {
         scene.add_geometry(&object_list[i]);
     }
-    scene.add_geometry(&Cat);
+    // scene.add_geometry(&Cat);
 
     std::vector<unsigned char> image(W * H * 3, 0);
 
     scene.render(image);
-    stbi_write_png("image5.png", W, H, 3, &image[0], 0);
+    stbi_write_png("image2_1.png", W, H, 3, &image[0], 0);
     std::time(&end);
     std::cout << end - start << std::endl;
 }
